@@ -2,6 +2,7 @@ const { google } = require('googleapis');
 const express = require('express');
 const stream = require('stream');
 const multer = require('multer');
+const https = require('https');
 const fs = require('fs');
 
 const app = express();
@@ -78,15 +79,15 @@ async function createFolder(name) {
   
   console.log(`Creating folder: ${name}`);
   const folderMetadata = {
-      name: name,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [DRIVE_ID]
+    name: name,
+    mimeType: 'application/vnd.google-apps.folder',
+    parents: [DRIVE_ID]
   };
   const folder = await drive.files.create({
     supportsTeamDrives: true,
-      driveId: DRIVE_ID, // Replace with your shared drive ID
-      resource: folderMetadata,
-      fields: 'id'
+    driveId: DRIVE_ID,
+    resource: folderMetadata,
+    fields: 'id'
   });
   return folder.data.id;
 }
@@ -133,6 +134,95 @@ async function checkBugIdExists(bugId) {
   });
 }
 
+const createResumableUpload = async (auth, fileMetadata) => {
+    const client = await auth.getClient();
+    const tokenResponse = await client.getAccessToken();
+    const accessToken = tokenResponse.token;
+
+    return new Promise((resolve, reject) => {
+        const metadataStr = JSON.stringify(fileMetadata);
+        const options = {
+            method: 'POST',
+            hostname: 'www.googleapis.com',
+            path: `/upload/drive/v3/files?uploadType=resumable&supportsTeamDrives=true&driveId=${DRIVE_ID}`,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': metadataStr.length,
+                'Authorization': `Bearer ${accessToken}` // Replace with your access token
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+                resolve(res.headers.location);
+            } else {
+                let errorData = '';
+                res.on('data', (chunk) => {
+                    errorData += chunk;
+                });
+                res.on('end', () => {
+                    reject(new Error(`Failed to create resumable upload session: ${res.statusCode} ${res.statusMessage} ${errorData}`));
+                });
+            }
+        });
+
+        req.on('error', (error) => {
+            reject(error);
+        });
+
+        req.write(metadataStr);
+        req.end();
+    });
+};
+
+// Works for 1GB files. 
+// Doesn't work for 3GB files:
+// Error uploading file: Error: write EPROTO
+//     at afterWriteDispatched (node:internal/stream_base_commons:160:15)
+//     at writevGeneric (node:internal/stream_base_commons:143:3)
+//     at Socket._writeGeneric (node:net:960:11)
+//     at TLSSocket.connect (node:net:940:12)
+//     at Object.onceWrapper (node:events:631:28)
+//     at TLSSocket.emit (node:events:529:35)
+//     at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1540:10) {
+//   errno: -71,
+//   code: 'EPROTO',
+//   syscall: 'write'
+const uploadFile = (uploadUrl, fileSize, fileMimeType, bufferStream) => {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(uploadUrl);
+        const options = {
+            method: 'PUT', // Resumable uploads use the PUT method
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            headers: {
+                'Content-Length': fileSize,
+                'Content-Type': fileMimeType 
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => {
+                data += chunk;
+            });
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(JSON.parse(data));
+                } else {
+                    reject(new Error(`Failed to upload file: ${res.statusCode} ${res.statusMessage}`));
+                }
+            });
+        });
+
+        req.on('error', (error) => {
+            reject(error);
+        });
+
+        bufferStream.pipe(req);
+    });
+};
+
 // Endpoint to handle file uploads
 app.post('/upload', upload.single('file'), async (req, res) => {
   if (req.file) {
@@ -152,22 +242,14 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         bufferStream.end(Buffer.from(req.file.buffer));
 
         // upload the file to the new folder
-        let media = {
-            mimeType: req.file.mimetype,
-            body: bufferStream
-        }
         const fileMetadata = {
             name: req.file.originalname,
             parents: [folder]
         };
-        await drive.files.create({
-          supportsTeamDrives: true,
-            driveId: DRIVE_ID, // Replace with your shared drive ID
-            resource: fileMetadata,
-            fields: 'id',
-            media: media
-        });
-        let userFeedback = `File uploaded successfully.\n<br>`;
+        let userFeedback = "";
+        const uploadUrl = await createResumableUpload(auth, fileMetadata);
+        await uploadFile(uploadUrl, req.file.size, req.file.mimetype, bufferStream);
+        userFeedback = userFeedback.concat(`File uploaded successfully.\n<br>`);
 
         // update bugzilla with comment
         if (await createBugzillaComment(req.body.bugid)){
@@ -192,42 +274,3 @@ app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
 
-// unused
-// async function createFile(filename, folder) {
-//     const fileMetadata = {
-//         name: filename,
-//         parents: [folder]
-//     };
-//     const file = await drive.files.create({
-//       supportsTeamDrives: true,
-//         driveId: DRIVE_ID, // Replace with your shared drive ID
-//         resource: fileMetadata,
-//         fields: 'id'
-//     });
-//     console.log('File ID: ', file.data.id);
-// }
-//
-// async function listFiles() {
-//     try {
-//         const response = await drive.files.list({
-//             // pageSize: 10, // Number of files to list
-//             fields: 'nextPageToken, files(id, name)',
-//             driveId: DRIVE_ID, // Replace with your shared drive ID
-//             includeItemsFromAllDrives: true,
-//             supportsAllDrives: true,
-//             corpora: 'drive' // This ensures the listing is specific to the shared drive
-//         });
-
-//         const files = response.data.files;
-//         if (files.length) {
-//             console.log('Files:');
-//             files.forEach(file => {
-//                 console.log(`${file.name} (${file.id})`);
-//             });
-//         } else {
-//             console.log('No files found.');
-//         }
-//     } catch (error) {
-//         console.error('The API returned an error: ', error);
-//     }
-// }
